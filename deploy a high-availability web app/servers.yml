@@ -1,0 +1,280 @@
+
+Parameters:
+  EnvironmentName:
+      Description: An environment name that will be prefixed to resource names
+      Type: String
+  VPCCIDR:
+    Description: "VPC CIDR"
+    Type: String
+Resources:
+
+  EIP1:
+    Type: AWS::EC2::EIP
+    Properties: 
+      Domain: vpc
+  
+  EIP2:
+    Type: AWS::EC2::EIP
+    Properties: 
+      Domain: vpc
+
+  NAT1:
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      AllocationId: !GetAtt EIP1.AllocationId
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-PUB-NETS-1"
+      
+  
+  NAT2:
+    Type: AWS::EC2::NatGateway
+    Properties: 
+      AllocationId: !GetAtt EIP2.AllocationId
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-PRIV-NETS-2"
+  
+  WebRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      VpcId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+
+  NATRoute1:
+    Type: AWS::EC2::Route
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0 
+      NatGatewayId: !Ref NAT1
+      RouteTableId: !Ref WebRouteTable1
+
+  AttachNAT1ToPrivateSubnet1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref WebRouteTable1
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-PRIV-NETS-1"
+
+  WebRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties: 
+      VpcId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+
+  NATRoute2:
+    Type: AWS::EC2::Route
+    Properties: 
+      DestinationCidrBlock: 0.0.0.0/0 
+      NatGatewayId: !Ref NAT2
+      RouteTableId: !Ref WebRouteTable2
+
+  AttachNAT2ToPrivateSubnet2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: 
+      RouteTableId: !Ref WebRouteTable2
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-PRIV-NETS-2"
+
+  EC2AccessS3:
+    Type: AWS::IAM::Role
+    Properties: 
+      Description: allow ec2 to gel s3 bucket content
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'  
+      ManagedPolicyArns: 
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      RoleName: EC2AccessS3
+
+  MyIamInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: MyIamInstanceProfile
+      Roles:
+      - !Ref EC2AccessS3
+
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: WebSecurityGroup
+      GroupDescription: "allow Http traffic"
+      SecurityGroupEgress: 
+        -   CidrIp: 0.0.0.0/0
+            FromPort: 0
+            IpProtocol: TCP
+            ToPort: 65535
+      SecurityGroupIngress: 
+        - CidrIp: !Ref VPCCIDR
+          FromPort: 0
+          IpProtocol: TCP
+          ToPort: 65535
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+
+  LaunchTemplate:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum install httpd -y
+          yum install unzip -y
+          systemctl start httpd
+          systemctl enable httpd
+          cd /var/www/html/
+          aws s3 cp s3://udacitysecondprojectmina/webiste.zip .
+          unzip webiste.zip -d .
+          rm webiste.zip
+      ImageId: ami-085925f297f89fce1
+      IamInstanceProfile: !Ref MyIamInstanceProfile
+      InstanceType: t2.medium
+      SecurityGroups: 
+      - !Ref WebSecurityGroup
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'
+
+  asg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties: 
+      AutoScalingGroupName: ASG
+      VPCZoneIdentifier:
+        - Fn::ImportValue:
+            !Sub "${EnvironmentName}-PRIV-NETS-1"
+        - Fn::ImportValue:
+            !Sub "${EnvironmentName}-PRIV-NETS-2"
+      LaunchConfigurationName:
+        Ref: LaunchTemplate
+      MaxSize: 6
+      MinSize: 2
+      TargetGroupARNs: 
+        - !Ref WebTargetGroup
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupDescription: allow http to ALB
+      GroupName: AllowHTTPALB
+      SecurityGroupEgress: 
+        - CidrIp: !Ref VPCCIDR
+          FromPort: 0
+          IpProtocol: TCP
+          ToPort: 65535
+      SecurityGroupIngress: 
+        - CidrIp: 0.0.0.0/0 
+          IpProtocol: TCP
+          FromPort: 80
+          ToPort: 80
+      VpcId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties: 
+      SecurityGroups: 
+        - !Ref ALBSecurityGroup
+      Subnets: 
+        - Fn::ImportValue:
+            !Sub "${EnvironmentName}-PUB-NETS-1"
+        - Fn::ImportValue:
+            !Sub "${EnvironmentName}-PUB-NETS-2"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties: 
+      DefaultActions: 
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref ALBListener
+        Priority: 1
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties: 
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 300
+      HealthCheckPath: /
+      HealthCheckPort: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 10
+      VpcId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: Bastion-Security-Group
+      GroupDescription: "allow ssh to Bastion Host"
+      SecurityGroupEgress: 
+        -   CidrIp: !Ref VPCCIDR
+            FromPort: 22
+            IpProtocol: TCP
+            ToPort: 22
+      SecurityGroupIngress: 
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          IpProtocol: TCP
+          ToPort: 22
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPC"
+
+  BationHost:
+    Type: AWS::EC2::Instance
+    Properties: 
+      BlockDeviceMappings: 
+        - DeviceName: "/dev/sdk"
+          Ebs:
+            VolumeSize: '10'
+      AvailabilityZone: !Select [ 0, !GetAZs '']
+      ImageId: ami-0323c3dd2da7fb37d 
+      InstanceType: t2.micro
+      KeyName: udacity-project
+      SubnetId: 
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-PUB-NETS-1"
+      SecurityGroupIds: 
+        - !Ref BastionSecurityGroup
+
+Outputs:
+  ALBURL:
+    Description: loadblance Link
+    Value: !Sub "http://${ALB.DNSName}"
+    Export: 
+      Name: !Sub "${EnvironmentName}-ALB-URL"
+  BastionPulicIP:
+    Description: IP of Bastion Host
+    Value: !GetAtt BationHost.PublicIp
+    Export: 
+      Name: BastionPulicIP
